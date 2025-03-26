@@ -12,6 +12,8 @@ import pygame
 import gymnasium as gym
 from gymnasium import spaces
 from gymnasium.spaces import Box
+from ray.rllib.utils.spaces.space_utils import flatten_space
+
 import torch
 #import cvxpy as cp
 from cvxpylayers.torch import CvxpyLayer
@@ -93,6 +95,26 @@ def get_env_layout(env_name: str):
             ],
             "field_size": (15.0, 12.0),
         },
+
+        "Conflict_situation-1.3": {
+            "obstacles": [
+                {"position": (3.0, 2.0), "dimensions": (2.0, 4.0)},  # obstacle at (2.0, 3.0) with a size of (1.0x1.0)
+            ],
+            "workstations": [
+                {"position": (3.0, 8.0), "dimensions": (2.0, 4.0)},  # Workstation at (8.0, 2.0)
+            ],
+            "walls": [
+                # Horizontal walls along the top and bottom
+                {"position": (3, 0.05), "dimensions": (6.0, 0.1)},  # Bottom wall
+                {"position": (3, 9.95), "dimensions": (6.0, 0.1)},  # Top wall
+                
+                # Vertical walls along the left and right sides
+                {"position": (0.05, 5.0), "dimensions": (0.1, 10.0)},  # Left wall
+                {"position": (5.95, 5.0), "dimensions": (0.1, 10.0)},  # Right wall
+            ],
+            "field_size": (6.0, 10.0),  # Overall factory floor dimensions
+        },
+        
         "Warehouse-1": {
             "obstacles": [
                 {"position": (3.0, 4.0), "dimensions": (2.0, 1.5)},  # Large storage rack
@@ -198,76 +220,125 @@ def get_predefined_start_positions(env_name: str, num_agents: int):
     
  
     return agent_positions
-    
 
-def get_random_start_positions(env_name: str, num_agents: int, margin, scale: int):
+
+def compute_optimal_values(object_size, min_grid_resolution=10, safety_factor=0.1):
+    object_width, object_height = object_size
+
+    # Compute scale to ensure at least min_grid_resolution per goal width
+    optimal_scale = int(min_grid_resolution / min(object_width, object_height))
+
+    # Compute margin to ensure goals stay clear of obstacles
+    optimal_margin = (min(object_width, object_height) / 2) + (safety_factor * min(object_width, object_height))
+
+    return optimal_scale, optimal_margin
+
+def get_restricted_regions(env_layout):
     """
-    Get the start positions of the agents randomly from non-restricted locations only.
+    Extracts all restricted areas (obstacles, workstations, walls) as bounding boxes.
+
+    Args:
+        env_layout (dict): The environment layout containing obstacles, workstations, walls.
+
+    Returns:
+        list: A list of restricted bounding boxes [(x_min, y_min, x_max, y_max), ...]
+    """
+    restricted_regions = []
+
+    
+    for category in ["obstacles", "workstations", "entrances", "storage_areas", "loading_docks", "walls"]:
+        for item in env_layout.get(category, []):
+            center_x, center_y = item["position"]
+            width, height = item["dimensions"]
+
+            # Convert center-based position to bounding box (top-left, bottom-right)
+            x_min = center_x - width / 2
+            y_min = center_y - height / 2
+            x_max = center_x + width / 2
+            y_max = center_y + height / 2
+
+            restricted_regions.append((x_min, y_min, x_max, y_max))
+    
+    return restricted_regions
+
+
+
+def is_valid_position(center, size, restricted_regions, existing_positions, min_dist=0.5):
+    """
+    Checks if a position collides with restricted areas or other agents.
+
+    Args:
+        center (tuple): The (x, y) center of the position.
+        size (tuple): The (width, height) of the object.
+        restricted_regions (list): List of bounding boxes [(x_min, y_min, x_max, y_max), ...]
+        existing_positions (list): List of existing centers to avoid overlap.
+        min_dist (float): Minimum distance between agent positions.
+
+    Returns:
+        bool: True if the position is valid (non-colliding), False otherwise.
+    """
+    x, y = center
+    width, height = size
+
+    # Convert center to bounding box
+    x_min, y_min = x - width / 2, y - height / 2
+    x_max, y_max = x + width / 2, y + height / 2
+
+    # Check for collisions with restricted regions
+    for rx_min, ry_min, rx_max, ry_max in restricted_regions:
+        if not (x_max <= rx_min or x_min >= rx_max or y_max <= ry_min or y_min >= ry_max):
+            return False  # Collision detected
+
+    # Ensure agents are not too close to each other
+    for ex, ey in existing_positions:
+        if ((x - ex) ** 2 + (y - ey) ** 2) ** 0.5 < min_dist:
+            return False  # Too close to another agent
+
+    return True  # No collisions detected
+
+def get_random_start_positions(env_name, num_agents, object_size, margin, scale, min_dist=0.5):
+    """
+    Generate non-colliding positions for agents using center-based coordinates.
 
     Args:
         env_name (str): The name of the environment.
         num_agents (int): The number of agents.
-        scale (int): Pixels per logical unit (sprite size scaling factor).
+        object_size (tuple): The (width, height) size of the object.
+        margin (float): Minimum distance from obstacles and boundaries.
+        scale (int): Pixels per logical unit.
+        min_dist (float): Minimum distance between agents.
 
     Returns:
-        dict: Keys are agent names (e.g., 'agent_0') and values are the start positions (tuples).
-
-    Raises:
-        ValueError: If the environment name is unknown or if the number of agents exceeds available positions.
+        dict: A dictionary mapping agent IDs to their positions (center-based).
     """
-    # Retrieve environment layout
     env_layout = get_env_layout(env_name)
     field_size = env_layout["field_size"]
-    obstacles = env_layout.get("obstacles", [])
-    workstations = env_layout.get("workstations", [])
-    entrances = env_layout.get("entrances", [])
-    storage_areas = env_layout.get("storage_areas", [])
-    loading_docks = env_layout.get("loading_docks", [])
+    restricted_regions = get_restricted_regions(env_layout)
 
-    # Convert obstacles, workstations, etc., into a set of restricted positions
-    restricted_positions = set()
-    def add_restricted_area(position, dimensions):
-        x, y = position
-        width, height = dimensions
-        for i in range(int(x * scale), int((x + width) * scale)):
-            for j in range(int(y * scale), int((y + height) * scale)):
-                restricted_positions.add((i, j))
+    width, height = object_size
+    valid_positions = []
+    existing_positions = []  # Store assigned positions
 
-    for obstacle in obstacles:
-        add_restricted_area(obstacle["position"], obstacle["dimensions"])
+    # Generate candidate positions
+    for x in range(int((margin + width / 2) * scale), int((field_size[0] - margin - width / 2) * scale)):
+        for y in range(int((margin + height / 2) * scale), int((field_size[1] - margin - height / 2) * scale)):
+            center = (x / scale, y / scale)
+            if is_valid_position(center, object_size, restricted_regions, existing_positions, min_dist):
+                valid_positions.append(center)
 
-    for workstation in workstations:
-        # Assume workstations are square sprites of size scale x scale if no dimensions are given
-        add_restricted_area(workstation["position"], (1, 1))
+    if num_agents > len(valid_positions):
+        raise ValueError(f"Not enough valid positions for {num_agents} agents in '{env_name}'.")
 
-    for entrance in entrances:
-        # Assume entrances are also square sprites
-        add_restricted_area(entrance["position"], (1, 1))
+    # Select agent positions randomly from valid ones
+    agent_positions = random.sample(valid_positions, num_agents)
+    
+    # Store chosen positions
+    for pos in agent_positions:
+        existing_positions.append(pos)
 
-    for storage in storage_areas:
-        add_restricted_area(storage["position"], storage["dimensions"])
 
-    for dock in loading_docks:
-        # Assume docks are square sprites
-        add_restricted_area(dock["position"], (1, 1))
-
-    # Generate all possible positions and filter out restricted positions
-#    margin = 1  # Margin to keep objects away from edges
-    possible_positions = [
-        (x / scale, y / scale)
-        for x in range(int(margin * scale), int(field_size[0] * scale - margin * scale))
-        for y in range(int(margin * scale), int(field_size[1] * scale - margin * scale))
-        if (x, y) not in restricted_positions
-    ]
-
-    if num_agents > len(possible_positions):
-        raise ValueError(f"Not enough free positions for {num_agents} agents in environment '{env_name}'.")
-
-    # Randomly sample starting positions for each agent
-    start_positions = random.sample(possible_positions, num_agents)
-    agent_positions = {f"agent_{i}": pos for i, pos in enumerate(start_positions)}
-
-    return agent_positions
+    # Return center-based positions
+    return {f"agent_{i}": pos for i, pos in enumerate(agent_positions)}
 
 
 
@@ -310,75 +381,199 @@ def get_predefined_goal_positions(env_name: str, num_agents: int):
 
 
 
-def get_random_goal_positions(env_name: str, num_agents: int, margin, scale: int):
+
+
+def is_valid_goal(goal_center, goal_size, restricted_regions):
     """
-    Get the goal positions of the agents randomly from non-restricted locations only.
+    Checks if a goal position collides with any restricted area.
+
+    Args:
+        goal_center (tuple): The (x, y) center of the goal.
+        goal_size (tuple): The (width, height) of the goal.
+        restricted_regions (list): List of bounding boxes [(x_min, y_min, x_max, y_max), ...]
+
+    Returns:
+        bool: True if the goal position is valid (non-colliding), False otherwise.
+    """
+    goal_x, goal_y = goal_center
+    goal_width, goal_height = goal_size
+
+    # Convert goal center to bounding box (top-left and bottom-right)
+    goal_x_min = goal_x - goal_width / 2
+    goal_y_min = goal_y - goal_height / 2
+    goal_x_max = goal_x + goal_width / 2
+    goal_y_max = goal_y + goal_height / 2
+
+    # Check if goal overlaps with any restricted region
+    for x_min, y_min, x_max, y_max in restricted_regions:
+        if not (goal_x_max <= x_min or goal_x_min >= x_max or
+                goal_y_max <= y_min or goal_y_min >= y_max):
+            return False  # Collision detected
+
+    return True  # No collision
+
+def get_random_goal_positions(env_name: str, num_agents: int, goal_size: tuple, margin: float, scale: int):
+    """
+    Generate non-colliding goal positions for agents using center-based coordinates.
 
     Args:
         env_name (str): The name of the environment.
         num_agents (int): The number of agents.
-        scale (int): Pixels per logical unit (sprite size scaling factor).
+        goal_size (tuple): The (width, height) size of the goal.
+        margin (float): Minimum distance from obstacles and boundaries.
+        scale (int): Pixels per logical unit.
 
     Returns:
-        dict: Keys are agent names (e.g., 'agent_0') and values are the goal positions (tuples).
-
-    Raises:
-        ValueError: If the environment name is unknown or if the number of agents exceeds available positions.
+        dict: A dictionary mapping agent IDs to their goal positions (center-based).
     """
-    # Retrieve environment layout
     env_layout = get_env_layout(env_name)
     field_size = env_layout["field_size"]
-    obstacles = env_layout.get("obstacles", [])
-    workstations = env_layout.get("workstations", [])
-    entrances = env_layout.get("entrances", [])
-    storage_areas = env_layout.get("storage_areas", [])
-    loading_docks = env_layout.get("loading_docks", [])
+    restricted_regions = get_restricted_regions(env_layout)
 
-    # Convert obstacles, workstations, etc., into a set of restricted positions
-    restricted_positions = set()
-    def add_restricted_area(position, dimensions):
-        x, y = position
-        width, height = dimensions
-        for i in range(int(x * scale), int((x + width) * scale)):
-            for j in range(int(y * scale), int((y + height) * scale)):
-                restricted_positions.add((i, j))
+    goal_width, goal_height = goal_size
+    valid_positions = []
 
-    for obstacle in obstacles:
-        add_restricted_area(obstacle["position"], obstacle["dimensions"])
+    # Generate potential goal center positions
+    for x in range(int((margin + goal_width / 2) * scale), int((field_size[0] - margin - goal_width / 2) * scale)):
+        for y in range(int((margin + goal_height / 2) * scale), int((field_size[1] - margin - goal_height / 2) * scale)):
+            goal_center = (x / scale, y / scale)
 
-    for workstation in workstations:
-        add_restricted_area(workstation["position"], (1, 1))
+            if is_valid_goal(goal_center, goal_size, restricted_regions):
+                valid_positions.append(goal_center)
 
-    for entrance in entrances:
-        add_restricted_area(entrance["position"], (1, 1))
+    if num_agents > len(valid_positions):
+        raise ValueError(f"Not enough valid positions for {num_agents} agents in '{env_name}'.")
 
-    for storage in storage_areas:
-        add_restricted_area(storage["position"], storage["dimensions"])
+    # Select goal positions randomly from valid ones
+    goal_positions = random.sample(valid_positions, num_agents)
 
-    for dock in loading_docks:
-        add_restricted_area(dock["position"], (1, 1))
+    
+    # Return center-based goal positions
+    return {f"agent_{i}": pos for i, pos in enumerate(goal_positions)}
 
-    # Generate all possible positions and filter out restricted positions
-#    margin = 1  # Margin to keep objects away from edges
-    possible_positions = [
-        (x / scale, y / scale)
-        for x in range(int(margin * scale), int(field_size[0] * scale - margin * scale))
-        for y in range(int(margin * scale), int(field_size[1] * scale - margin * scale))
-        if (x, y) not in restricted_positions
-    ]
 
-    if num_agents > len(possible_positions):
-        raise ValueError(f"Not enough free positions for {num_agents} agents in environment '{env_name}'.")
 
-    # Randomly sample goal positions for each agent
-    goal_positions = random.sample(possible_positions, num_agents)
-    agent_goals = {f"agent_{i}": pos for i, pos in enumerate(goal_positions)}
 
-    return agent_goals
+
+
+
 
 
 #----------------------------OBSERVATION AND ACTION SPACES UTILS--------------------------------------------------------
 
+
+def generate_space(
+    agents, field_size, obstacles, workstations, entrances, storage_areas,
+    loading_docks, walls, max_speed, sensor_range, num_sensor_rays,
+    collision_boundaries, num_agents, max_timesteps
+):
+    """
+    Generate unified observation and action spaces for multi-agent environments.
+    """
+    sensor_range = max(sensor_range, 1)
+    
+    # Define individual agent action space
+    action_spec = spaces.Box(
+        low=np.array([-np.pi, 0.0]),
+        high=np.array([np.pi, max_speed]),
+        shape=(2,),
+        dtype=np.float32
+    )
+    
+    # Observation space for a single agent
+
+    common_dict = {}
+
+    # Handle common dict categories dynamically
+    for category_name, category_data in [
+        ('obstacles', obstacles),
+        ('workstations', workstations),
+        ('entrances', entrances),
+        ('storage_areas', storage_areas),
+        ('loading_docks', loading_docks),
+        ('walls', walls)
+    ]:
+        if category_data:
+            # Flatten positions and dimensions into a consistent format
+            flat_data = [
+                (pos[0], pos[1], dim[0], dim[1])  # Extract elements from (position, dimensions) tuple
+                for pos, dim in category_data
+            ]
+            common_dict[category_name] = spaces.Box(
+                low=np.zeros((len(flat_data) * 4,)),
+                high=np.tile(np.array([field_size[0], field_size[1], field_size[0], field_size[1]]), len(flat_data)),
+                shape=(len(flat_data) * 4,),
+                dtype=np.float32
+            )
+    
+    # Define the observation space for the agent
+    observation_space = spaces.Dict({
+        "common": spaces.Dict(common_dict),
+        "position": spaces.Box(
+            low=np.array([1.0, 1.0]),
+            high=np.array([field_size[0] - 1, field_size[1] - 1]),
+            shape=(2,),
+            dtype=np.float32
+        ),
+        "velocity": spaces.Box(
+            low=np.array([-max_speed]),
+            high=np.array([max_speed]),
+            shape=(1,),
+            dtype=np.float32
+        ),
+        "goal": spaces.Box(
+            low=np.array([0.0, 0.0]),
+            high=np.array([field_size[0]-1, field_size[1]-1]),
+            shape=(2,),
+            dtype=np.float32
+        ),
+        "orientation": spaces.Box(
+            low=np.array([-np.pi]),
+            high=np.array([np.pi]),
+            shape=(1,),
+            dtype=np.float32
+        ),
+        "local_sensor_observations": spaces.Box(
+            low=np.zeros(num_sensor_rays, dtype=np.uint8),
+            high=np.full(num_sensor_rays, sensor_range, dtype=np.uint8),
+            shape=(num_sensor_rays,),
+            dtype=np.uint8
+        ),
+
+        "other_agents_relative_positions": spaces.Box(
+            low=np.zeros((num_agents - 1) * 2),
+            high=np.tile(np.array([field_size[0] - 1, field_size[1] - 1]), num_agents - 1),
+            shape=((num_agents - 1) * 2,),
+            dtype=np.float32
+        ),
+
+        "other_collision_categories_to_avoid_distances": spaces.Box(
+            low=np.zeros(len(collision_boundaries.keys()), dtype=np.float32),
+            high=np.full(len(collision_boundaries.keys()), sensor_range, dtype=np.float32),
+            shape=(len(collision_boundaries.keys()),),
+            dtype=np.float32
+        ),
+       # "time_step": spaces.Discrete(max_timesteps),
+        #"status": spaces.Discrete(3),
+       # "action_mask": spaces.MultiBinary(2)
+    })
+
+    
+    # Create spaces for all agents
+    #observation_space = spaces.Dict({
+    #    f"agent_{i}": single_observation_space for i in range(num_agents)
+    #})
+    #action_space = spaces.Dict({
+    #    f"agent_{i}": action_spec for i in range(num_agents)
+    #})
+
+    #flattened_observation_space = flatten_space(observation_space)
+    #flattened_action_spec = flatten_space(action_spec)
+    
+    flattened_observation_space = spaces.flatten_space(observation_space)
+    #flattened_action_spec = spaces.flatten_space(action_spec)
+    
+    return flattened_observation_space, action_spec
 
 
 def generate_spaces(agents, field_size, obstacles, workstations, entrances, 
@@ -416,7 +611,8 @@ def generate_spaces(agents, field_size, obstacles, workstations, entrances,
         for agent in agents
     }
 
-    observation_spaces = {}
+    
+    #observation_spaces = {}
     for agent in agents:
         common_dict = {}
 
@@ -443,7 +639,7 @@ def generate_spaces(agents, field_size, obstacles, workstations, entrances,
                 )
         
         # Define the observation space for the agent
-        observation_spaces[agent] = spaces.Dict({
+        single_observation_space = spaces.Dict({
             "common": spaces.Dict(common_dict),
             "position": spaces.Box(
                 low=np.array([1.0, 1.0]),
@@ -475,24 +671,14 @@ def generate_spaces(agents, field_size, obstacles, workstations, entrances,
                 shape=(num_sensor_rays,),
                 dtype=np.uint8
             ),
-            "sensor_proximity_map": spaces.Box(
-                low=np.array([0]),
-                high=np.array([sensor_range]),
-                shape=(sensor_range**2,),
-                dtype=np.uint8
-            ),
+
             "other_agents_relative_positions": spaces.Box(
                 low=np.zeros((num_agents - 1) * 2),
                 high=np.tile(np.array([field_size[0] - 1, field_size[1] - 1]), num_agents - 1),
                 shape=((num_agents - 1) * 2,),
                 dtype=np.float32
             ),
-            "other_collision_categories_to_avoid_map": spaces.Box(
-                low=np.zeros(field_size[0] * field_size[1], dtype=np.float32),
-                high=np.ones(field_size[0] * field_size[1], dtype=np.float32),
-                shape=(field_size[0] * field_size[1],),
-                dtype=np.float32
-            ),
+
             "other_collision_categories_to_avoid_distances": spaces.Box(
                 low=np.zeros(len(collision_boundaries.keys()), dtype=np.float32),
                 high=np.full(len(collision_boundaries.keys()), sensor_range, dtype=np.float32),
@@ -503,6 +689,11 @@ def generate_spaces(agents, field_size, obstacles, workstations, entrances,
             #"status": spaces.Discrete(3),
            # "action_mask": spaces.MultiBinary(2)
         })
+
+        
+        observation_spaces = spaces.Dict({
+            f"agent_{i}": single_observation_space for i in range(num_agents)
+        })    
 
     return observation_spaces, action_spaces
 
@@ -717,6 +908,33 @@ def _render_human(self):
 
 
 #-------------------------------SPRITES, IMAGES AND RENDERING HELPER UTILS-----------------------------------------------
+
+def compute_screen_size(field_size, target_resolution=(1100, 900), min_scale=50):
+    """
+    Computes optimal screen width and height for a given environment field size.
+
+    Args:
+        field_size (tuple): The (width, height) of the environment in logical units.
+        target_resolution (tuple): Approximate desired screen resolution (width, height).
+        min_scale (int): Minimum scaling factor to maintain visibility.
+
+    Returns:
+        tuple: (screen_width, screen_height, scale)
+    """
+    field_width, field_height = field_size
+
+    # Compute scale to fit within target resolution
+    scale_x = target_resolution[0] / field_width
+    scale_y = target_resolution[1] / field_height
+
+    # Choose the smallest scale to fit within the screen while keeping minimum visibility
+    scale = max(min(scale_x, scale_y), min_scale)
+
+    # Compute screen size
+    screen_width = int(field_width * scale)
+    screen_height = int(field_height * scale)
+
+    return screen_width, screen_height, scale
 
 
 def get_sprite_sizes(env_layout, agent_size, goal_size, scale_x, scale_y):
@@ -983,7 +1201,9 @@ def _initialize_sprites(
 
 
 
-def draw_agent_goal_rects(screen, agent_rects, goal_rects, unique_agent_goal_colors, terminated_agents):
+
+def draw_agent_goal_rects(screen, agent_rects, goal_rects, unique_agent_goal_colors, 
+                          terminated_agents, goal_positions, goal_size, scale_x, scale_y):
     """
     Draw rectangles around agents and their goals, with a unique color mapping each agent to its goal.
     Terminated agents are visually distinct.
@@ -995,9 +1215,61 @@ def draw_agent_goal_rects(screen, agent_rects, goal_rects, unique_agent_goal_col
         unique_agent_goal_colors (dict): Mapping of agent IDs to unique RGB colors.
         terminated_agents (set): Set of agent IDs that have terminated (reached their goals).
     """
+    def _make_goal_rects(goal_positions, goal_size, scale_x, scale_y):
+        """
+        Create a dictionary of rects for goals to prevent agents from occupying other agents' goals.
+    
+        Args:
+            goal_positions (dict): Dictionary with agent IDs as keys and (x, y) goal positions as values.
+            goal_size (tuple): Size of each goal in logical units (width, height).
+            scale_x (float): Scaling factor for x-axis.
+            scale_y (float): Scaling factor for y-axis.
+    
+        Returns:
+            dict: Dictionary of agent IDs mapped to their corresponding pygame.Rect objects.
+    
+        Usage:
+            used by "setup_collision_boundaries(env_layout, goal_positions, goal_size, scale_x, scale_y)" function.
+            used by "init" method inside the ContinuousPathfindingEnv class for "self.goal_rects".
+            
+        """
+        rects = {}
+       
+        for agent_id, position in goal_positions.items():  # Iterate over the dictionary
+            # Validate the goal position
+            if not isinstance(position, (tuple, list, np.ndarray)) or len(position) != 2:
+                raise ValueError(f"Invalid goal position for {agent_id}: {position}, expected a 2D tuple, list, or ndarray.")
+            
+            # Unpack position
+            center_x, center_y = position
+    
+            # Scale dimensions and center position
+            scaled_width = goal_size[0] * scale_x
+            scaled_height = goal_size[1] * scale_y
+            scaled_center_x = center_x * scale_x
+            scaled_center_y = center_y * scale_y
+    
+            # Create a pygame.Rect with scaled dimensions and center position
+            rect = pygame.Rect(0, 0, scaled_width, scaled_height)
+            rect.center = (scaled_center_x, scaled_center_y)
+    
+            # Map agent ID to its rect
+            rects[agent_id] = rect
+        
+        # Validate all rects before returning
+        assert all(isinstance(rect, pygame.Rect) for rect in rects.values()), "All elements in rects must be pygame.Rect"
+        
+        return rects 
+
+    simulation_goal_rects = _make_goal_rects(goal_positions, goal_size, scale_x, scale_y)
+        
+    
     for agent_id, agent_rect in agent_rects.items():
+        
+        simulation_goal_rect = simulation_goal_rects.get(agent_id)
+
         # Determine the color for the agent
-        if agent_id in terminated_agents:
+        if agent_id in terminated_agents and simulation_goal_rect and agent_rect == simulation_goal_rect:
             # Distinct color/style for terminated agents (e.g., green and filled)
             agent_color = (255, 0, 0)  # Red for terminated agents
             agent_outline_width = 0    # Filled rectangle
@@ -1005,16 +1277,25 @@ def draw_agent_goal_rects(screen, agent_rects, goal_rects, unique_agent_goal_col
             # Normal color/style for active agents
             agent_color = unique_agent_goal_colors.get(agent_id, (255, 255, 255))  # Default to white
             agent_outline_width = 2    # Outline only
+            
+
 
         # Draw the rectangle around the agent
         pygame.draw.rect(screen, agent_color, agent_rect, agent_outline_width)
 
+        # Create and draw the corresponding goal rectangle
+        #simulation_goal_rect = simulation_goal_rects.get(agent_id)
+        if simulation_goal_rect:  # Ensure goal_rect exists before trying to draw
+            # Use the same color as the agent, but always outlined for the goal
+            pygame.draw.rect(screen, agent_color, simulation_goal_rect, 2)  # Width 2 for outline
+            
+        """
         # Retrieve and draw the corresponding goal rectangle
         goal_rect = goal_rects.get(agent_id)
         if goal_rect:  # Ensure goal_rect exists before trying to draw
             # Use the same color as the agent, but always outlined for the goal
             pygame.draw.rect(screen, agent_color, goal_rect, 2)  # Width 2 for outline
-
+            """
 
 
 def generate_unique_color(existing_colors, min_distance=50):
@@ -1647,9 +1928,9 @@ def _compute_agent_observation(
         "goal": np.array(agent_goal, dtype=np.float32),  # Shape (2,)
         "orientation": np.array([agent_orientation], dtype=np.float32),  # Shape (1,)
         "local_sensor_observations": np.array(lidar_readings, dtype=np.float32),  # Shape (num_sensor_rays,)
-        "sensor_proximity_map": np.array(sensor_proximity_map, dtype=np.float32).flatten(),  # Flatten to 1D
+        #"sensor_proximity_map": np.array(sensor_proximity_map, dtype=np.float32).flatten(),  # Flatten to 1D
         "other_agents_relative_positions": agents_relative_positions,  # Shape (N,)
-        "other_collision_categories_to_avoid_map": np.array(other_collision_categories_to_avoid_map, dtype=np.float32),  # Shape (N,)
+        #"other_collision_categories_to_avoid_map": np.array(other_collision_categories_to_avoid_map, dtype=np.float32),  # Shape (N,)
         "other_collision_categories_to_avoid_distances": np.array(collision_distances, dtype=np.float32),  # Shape (N,)
         #"agent_proximities": np.zeros((len(agents_relative_positions),), dtype=np.float32),  # Placeholder, Shape (N,)
         #"time_step": np.array([time_step if time_step is not None else 0], dtype=np.float32),  # Shape (1,)
@@ -1694,7 +1975,7 @@ def _flatten_observation(observation):
             # For any unhandled types, just convert to a numpy array
             flattened_obs.append(np.array(value).flatten())
 
-    return np.concatenate(flattened_obs)
+    return np.concatenate(flattened_obs, dtype=np.float32)
 
 def flatten_observation(obs_values):
     """Flatten nested observations into a PyTorch tensor."""
@@ -1857,7 +2138,7 @@ def _create_goal_rects(goal_positions, goal_size, scale_x, scale_y):
     # Validate all rects before returning
     assert all(isinstance(rect, pygame.Rect) for rect in rects.values()), "All elements in rects must be pygame.Rect"
     
-    return rects
+    return {} # return rects if goals are to be avoided by the agents 
     
 
 def setup_collision_boundaries(env_layout, goal_positions, goal_size, scale_x, scale_y):
@@ -1885,7 +2166,8 @@ def setup_collision_boundaries(env_layout, goal_positions, goal_size, scale_x, s
     categories = ["obstacles", "entrances", 
                   "workstations", "walls", 
                   "storage_areas", "loading_docks", 
-                  "goal_boundaries", "agent_boundaries"] # dynamic agent_boundaries will be created inside the step method
+                  "goal_boundaries", 
+                  "agent_boundaries"] # dynamic agent_boundaries will be created inside the step method
 
     for category in categories:
         if category in env_layout:
@@ -2118,6 +2400,81 @@ def _is_position_valid_XMG(agent, agent_rect, collision_boundaries, agent_rects,
 
     # If no collisions are detected, the position is valid
     return True
+    
+def _is_position_valid_XMAG(agent, agent_rect, collision_boundaries, agent_rects, goal_rects):
+    """
+    Check if the agent's new position is valid by detecting collisions with obstacles or other categories,
+    ignoring its own rectangle and all goals! (excluding mine, that of my goal, and that of other goals).
+
+    Args:
+        agent (str): The agent's ID.
+        agent_rect (pygame.Rect): The agent's rectangle for collision testing.
+        collision_boundaries (dict): Dictionary of collision boundaries by category.
+        agent_rects (dict): Dictionary of other agents' rects.
+        goal_rects (dict): Dictionary of goal rects.
+
+    Returns:
+        bool: True if the position is valid, False if there is a collision.
+
+    Usage:
+        -> used by the "_calculate_reward" function.
+        -> used by the the step method ....
+        
+    """
+    # Validate input types
+    assert isinstance(agent_rect, pygame.Rect), f"agent_rect is not a pygame.Rect: {agent_rect}"
+    assert all(isinstance(rect, pygame.Rect) for rect in agent_rects.values()), "All elements in agent_rects must be pygame.Rect"
+    assert all(isinstance(rect, pygame.Rect) for rect in goal_rects.values()), "All elements in goal_rects must be pygame.Rect"
+
+    """
+    # Check an agent's boundary area to see if is collides with other collision category boundary areas, while ignoring 
+    the agent's boundary area.
+    """
+    # Iterate through all categories in the collision_boundaries
+    for category, category_data in collision_boundaries.items():
+        
+        # Case 1: If category data is a list of rectangles (e.g., 'obstacles', 'workstations', 'walls')
+        if isinstance(category_data, list):
+            for boundary_rect in category_data:
+                if agent_rect.colliderect(boundary_rect):
+                    #print(f"Collision detected with {category} boundary at {boundary_rect}!.")
+                    #print("$"*100)
+                    return False
+        
+        # Case 2: If category data is a dictionary of rectangles (e.g., 'goal_boundaries', 'agent_boundaries')
+        elif isinstance(category_data, dict):
+            for other_agent, boundary_rect in category_data.items():
+                # Skip checking the agent's own rectangle in agent-boundaries
+                if agent == other_agent:  # (excluding mine and that of my goal)
+                    continue
+                
+                # Check for collisions with other agent's goal areas or agent boundaries
+                if agent_rect.colliderect(boundary_rect):
+                    #print(f"Collision detected with {category} ({other_agent}) at {boundary_rect}!.")
+                    #print("$"*100)
+                    return False
+    
+    # Check for collisions with other agents' positions (from agent_rects)
+    for other_agent, other_rect in agent_rects.items():
+        if agent != other_agent:  # Skip checking self
+            if agent_rect.colliderect(other_rect):
+                #print(f"Collision detected with another agent! for {other_agent}'s position at {other_rect}.")
+                #print("$"*100)
+                return False
+                
+    """
+    # Check for collisions with other agents' goal rects (from goal_rects)
+    for other_agent, goal_rect in goal_rects.items():
+        if agent != other_agent:  # Skip checking that agent's goal rectangle collision
+            if agent_rect.colliderect(goal_rect):
+                #print("Debug _is_position_valid Function:")
+                #print(f"Collision detected with another agent's goal! for {other_agent}'s goal area at {goal_rect}.")
+                #print("$"*100)
+                return False
+                """
+
+    # If no collisions are detected, the position is valid
+    return True
 
 #---------------------------------------REWARD UTILS------------------------------------------------
 
@@ -2150,7 +2507,10 @@ def _calculate_reward(agent, distance_to_goal, previous_distances, agent_rects, 
     reward = 0.0
 
     # 1. Positive reward for moving closer to the goal
-    previous_distance = previous_distances.get(agent, float("inf"))
+    previous_distance = previous_distances.get(agent, None)
+    if previous_distance is None or np.isinf(previous_distance) or np.isnan(previous_distance):
+        previous_distance = distance_to_goal  # Avoids inf in first step
+
     if distance_to_goal < previous_distance:
         reward += (previous_distance - distance_to_goal) * reward_scale_goal_proximity
     else:

@@ -6,12 +6,14 @@ import logging
 import time
 import gymnasium as gym
 from gymnasium import spaces
+from gymnasium.spaces import Box
 
 from typing import Dict, Tuple, Optional
 
 import ray
 from ray.rllib.env.multi_agent_env import MultiAgentEnv
 from ray.rllib.env.env_context import EnvContext
+from ray.rllib.utils.spaces.space_utils import flatten_space
 from ray.rllib.algorithms.ppo import PPOConfig
 from ray import air
 from ray import tune
@@ -20,6 +22,13 @@ from ray.rllib.connectors.env_to_module import MeanStdFilter
 from ray.tune.schedulers import HyperBandScheduler
 #import diffcp
 #import cvxpy
+
+from ray.rllib.utils.test_utils import (
+    add_rllib_example_script_args,
+    run_rllib_example_script_experiment,
+)
+from ray.tune.registry import get_trainable_cls
+
 
 #import matplotlib.pyplot as plt
 #import pandas as pd
@@ -49,9 +58,9 @@ class ContinuousPathfindingEnv(MultiAgentEnv):
 
     Default Environment Configuration Setup:
     simulation_env_config = { 
-    "agent_count": 3, "env_name": "Factory-1", "scale": 1, "screen_width": 960, "screen_height": 640,
-    "margin": 1, "starting_point": False, "agent_size": (0.2, 0.2), "goal_size": (0.5, 0.5), 
-    "timesteps_per_episode": 5000,"max_speed": 1.0, "goal_radius": 0.1, "dt": 0.05, "sensor_range": 1,
+    "agent_count": 3, "env_name": "Factory-1", "scale": 1, 
+    "starting_point": False, "agent_size": (0.2, 0.2), "goal_size": (0.5, 0.5), 
+    "timesteps_per_episode": 5000,"max_speed": 1.0, "goal_radius": 0.1, "dt": 0.05, "sensor_range_factor": 1.5,
     "num_sensor_rays": 45, "sensor_fov": np.pi*2, "obstacle_density": 0.1, "render_mode": None,
     }
 
@@ -65,15 +74,12 @@ class ContinuousPathfindingEnv(MultiAgentEnv):
     }
 
     def __init__(self, env_config: EnvContext, render_mode: Optional[str] = None):
-        super().__init__()
+        #super().__init__()
 
         # Defines expected bounds or acceptable ranges for each configuration parameter
         config_bounds = {
             "agent_count": (2, 7),             # Min 1 agent, max 7 agents
-            "scale": (1, 10), 
-            "screen_width": (1, 9600), 
-            "screen_height": (1, 6400),
-            "margin": (0, 32),  
+            "scale": (1, 50), 
             "timesteps_per_episode": (1, 50000), # Reasonable bounds for episode length
             "max_speed": (0.0001, 1.0),          # Max speed between 0.0001 and 1.0
             "goal_radius": (0.01, 2.0),          # Radius from 0.01 to 2.0
@@ -115,11 +121,10 @@ class ContinuousPathfindingEnv(MultiAgentEnv):
         # For accessing RLlib-specific metadata like worker index
 #        self.worker_index = env_config.worker_index
 #        self.vector_index = env_config.vector_index
-        # Scale in pixels per unit
-        self.scale = self.env_config.get("scale", 1)  # Number of pixels per grid/logical unit
-        self.screen_width = self.env_config.get("screen_width", 960)
-        self.screen_height = self.env_config.get("screen_height", 640)
-        self.margin = self.env_config.get("margin", 1)
+
+
+
+
         """
         print('-'*100)
         print("screen_width:", self.screen_width)
@@ -127,6 +132,16 @@ class ContinuousPathfindingEnv(MultiAgentEnv):
         print("screen_height:", self.screen_height)
         print('-'*100)        
             """
+
+        # Initialize agent and goal sizes in world units
+        self.agent_size = self.env_config.get("agent_size", (0.35, 0.35)) # Logical units
+        self.goal_size = self.env_config.get("goal_size", (0.25, 0.25)) # Logical units
+
+        # Initialize Scale (in pixels per unit) and margin
+        self.agent_scale, self.agent_margin = compute_optimal_values(object_size=self.agent_size)
+        self.goal_scale, self.goal_margin = compute_optimal_values(object_size=self.goal_size)
+        self.margin = self.agent_margin
+        self.scale = self.env_config.get("scale", 1)
         
         # Set up grid and agent start and goal positions based on environment config
         self.starting_point = self.env_config.get("starting_point", False)
@@ -136,10 +151,18 @@ class ContinuousPathfindingEnv(MultiAgentEnv):
             self.start_positions = get_predefined_start_positions(env_name=self.env_name, num_agents=self.num_agents)
             self.goal_positions = get_predefined_goal_positions(env_name=self.env_name, num_agents=self.num_agents)
         else:
-            self.start_positions = get_random_start_positions(env_name=self.env_name, num_agents=self.num_agents, 
-                                                              margin=self.margin, scale=self.scale)
-            self.goal_positions = get_random_goal_positions(env_name=self.env_name, num_agents=self.num_agents, 
-                                                            margin=self.margin, scale=self.scale)
+            self.start_positions = get_random_start_positions(env_name=self.env_name, 
+                                                              num_agents=self.num_agents,
+                                                              object_size=self.agent_size,
+                                                              margin=self.agent_margin, 
+                                                              scale=self.agent_scale)
+            
+            self.goal_positions = get_random_goal_positions(env_name=self.env_name, 
+                                                            num_agents=self.num_agents, 
+                                                            goal_size=self.goal_size, 
+                                                            margin=self.goal_margin, 
+                                                            scale=self.goal_scale
+                                                            )
 
 
         # Initialize agent states (positions, goals, speeds, and orientations)
@@ -153,9 +176,12 @@ class ContinuousPathfindingEnv(MultiAgentEnv):
                     print(f"Regenerating goal for {agent} due to collision with {other_agent}")
                     while True:
                         # Generate a new goal for the agent
-                        new_goal = get_random_goal_positions(
-                            self.env_name, self.num_agents, margin=self.margin, scale=self.scale
-                        )[agent]
+                        new_goal =  get_random_goal_positions(env_name=self.env_name, 
+                                                            num_agents=self.num_agents, 
+                                                            goal_size=self.goal_size, 
+                                                            margin=self.goal_margin, 
+                                                            scale=self.goal_scale
+                                                            )[agent]
                         # Ensure the new goal is not the same as the current position or any other goal
                         if not np.array_equal(new_goal, self.agent_positions[agent]) and not np.array_equal(new_goal, other_goal):
                             self.agent_goals[agent] = new_goal
@@ -164,9 +190,7 @@ class ContinuousPathfindingEnv(MultiAgentEnv):
         self.agent_speeds = {agent: 0.0 for agent in self.agents}
         self.agent_orientations = {agent: 0.0 for agent in self.agents}
 
-        # Initialize agent and goal sizes in world units
-        self.agent_size = self.env_config.get("agent_size", (0.35, 0.35)) # Logical units
-        self.goal_size = self.env_config.get("goal_size", (0.25, 0.25)) # Logical units
+
 
 
 
@@ -192,14 +216,15 @@ class ContinuousPathfindingEnv(MultiAgentEnv):
         
         # Episode and agent-specific attributes
         self.current_step = 0
-        self.max_timesteps = self.env_config.get("timesteps_per_episode", 5000)
+        self.max_timesteps = self.env_config.get("timesteps_per_episode", 5)
         self.max_speed = self.env_config.get("max_speed", 1.0)
         self.goal_radius = self.env_config.get("goal_radius", 0.1)  # Distance within which the goal is considered reached
         self.dt = self.env_config.get("dt", 0.5)   # dt
 #        self.sensor_range = self.env_config.get("sensor_range", 1)
 
         # Initialize sensor parameters
-        self.sensor_range = max(self.agent_size[0], self.agent_size[1]) * 2.5  # Maximum range of sensors
+        self.sensor_range_factor = env_config.get("sensor_range_factor", 1.5)  # Number of rays
+        self.sensor_range = max(self.agent_size[0], self.agent_size[1]) * self.sensor_range_factor  # Maximum range of sensors
 #        self.sensor_range = round(max(self.agent_size[0], self.agent_size[1]) * 2)  # Maximum range of sensors. Round to keep as integer
         self.num_sensor_rays = env_config.get("num_sensor_rays", 45)  # Number of rays
         self.sensor_fov = env_config.get("sensor_fov", np.pi*2)  # Field of view in radians (equiv 360 degrees)
@@ -293,9 +318,14 @@ class ContinuousPathfindingEnv(MultiAgentEnv):
         # Store the larger of the horizontal and vertical margins
         self.computed_margin = max(self.horizontal_margin, self.vertical_margin)
 
+        # Initialize environment display parameters
+        self.screen_width, self.screen_height, self.common_scale = compute_screen_size(self.field_size)
+        
         #Initialize scale_x and scale_y
-        self.scale_x = self.screen_width / self.field_size[0]  # Pixels per logical unit (x)
-        self.scale_y = self.screen_height / self.field_size[1]  # Pixels per logical unit (y)       
+        #self.scale_x = self.screen_width / self.field_size[0]  # Pixels per logical unit (x)
+        #self.scale_y = self.screen_height / self.field_size[1]  # Pixels per logical unit (y) 
+        self.scale_x = self.common_scale  # Pixels per logical unit (x)
+        self.scale_y = self.common_scale  # Pixels per logical unit (y)
         print("scale_x, scale_y:", self.scale_x, self.scale_y)
         print('-'*100) 
 
@@ -371,8 +401,50 @@ class ContinuousPathfindingEnv(MultiAgentEnv):
         self.goal_boundaries = self.collision_boundaries.get("goal_boundaries", [])
         self.agent_boundaries = self.collision_boundaries.get("agent_boundaries", [])
 
+
+        
         # Initialize action and observation spaces by calling generate_spaces function        
         #  Define observation space for each agent with added complexity (hybrid obs-> common and agent specific)
+        self.obs_space, self.act_space = generate_space(
+            agents=list(self.agents),  #  self.agents contains all agent IDs
+            field_size=self.field_size,  #  field_size is an attribute of the environment
+            obstacles=self.obstacles,
+            workstations=self.workstations,
+            entrances=self.entrances,
+            storage_areas=self.storage_areas,
+            loading_docks=self.loading_docks,
+            walls=self.walls,
+            max_speed=self.max_speed,
+            sensor_range=self.sensor_range,
+            num_sensor_rays=self.num_sensor_rays,
+            collision_boundaries=self.collision_boundaries,
+            num_agents=len(self.agents),
+            max_timesteps=self.max_timesteps,
+        )
+            
+         # Define spaces for each agent
+        #self.spaces = {f"agent_{i}": {"action_space": self.action_space, "observation_space": self.observation_space} for i in range(self.num_agents)}
+
+        
+        # Initialize action and observation spaces by calling generate_spaces function        
+        #  Define observation space for each agent with added complexity (hybrid obs-> common and agent specific)
+        self.observation_spaces = {f"agent_{i}": self.obs_space for i in range(self.num_agents)}
+        self.action_spaces = {f"agent_{i}": self.act_space for i in range(self.num_agents)}
+
+        
+        """
+        
+        self.observation_spaces = {}
+        self.action_spaces = {}
+
+        # Dynamically create observation and action spaces for each agent
+        for i in range(self.num_agents):
+            self.observation_spaces[f"agent_{i}"] = gym.spaces.Box(low=-1.0, high=1.0, shape=(10,))
+            self.action_spaces[f"agent_{i}"] = gym.spaces.Discrete(2)  # Example: 2 possible actions for each agent
+
+        
+            """
+        """
         self.observation_spaces, self.action_spaces = generate_spaces(
             agents=list(self.agents),  #  self.agents contains all agent IDs
             field_size=self.field_size,  #  field_size is an attribute of the environment
@@ -394,7 +466,8 @@ class ContinuousPathfindingEnv(MultiAgentEnv):
         # This combines all individual agents' observation spaces (self.observation_spaces) into a single spaces.Dict object.
         #self.action_space = spaces.Dict(self.action_spaces)
         #self.observation_space = spaces.Dict(self.observation_spaces) 
-
+            """
+        
         """
         # If the concerned Framework (e.g. rllib) Expects a Flattened Observation/Action Space:
         #    Then, Flatten all agent-specific spaces into a single global space:
@@ -433,11 +506,11 @@ class ContinuousPathfindingEnv(MultiAgentEnv):
 
         
         # Initialize reward-related attributes/parameters
-        self.reward_scale_goal_proximity = 10.0  # Scaling factor for goal proximity reward
-        self.penalty_no_progress = 1.0
-        self.penalty_collision = 5.0
-        self.penalty_proximity = 2.0
-        self.penalty_proximity_obstacle = 1.0
+        self.reward_scale_goal_proximity = 10.0*0.001  # Scaling factor for goal proximity reward
+        self.penalty_no_progress = 1.0*0.001
+        self.penalty_collision = 5.0*0.001
+        self.penalty_proximity = 2.0*0.001
+        self.penalty_proximity_obstacle = 1.0*0.001
         self.reward_goal_reached = 100.0
 
         
@@ -470,9 +543,10 @@ class ContinuousPathfindingEnv(MultiAgentEnv):
                         f"{base_path}goal_3_sprite.jpg", f"{base_path}goal_4_sprite.jpg",
                         f"{base_path}goal_5_sprite.jpg", f"{base_path}goal_6_sprite.jpg", 
                         f"{base_path}goal_7_sprite.jpg"],
-                "obstacle": [f"{base_path}obstacle_1_sprite.png", f"{base_path}obstacle_2_sprite.png"],
+                "obstacle": [f"{base_path}obstacle_3_sprite.png",f"{base_path}obstacle_1_sprite.png", 
+                             f"{base_path}obstacle_2_sprite.png"],
                 "entrance": [f"{base_path}entrance_1_sprite.jpg"],
-                "workstation": [f"{base_path}workstation_1_sprite.png"],
+                "workstation": [f"{base_path}workstation_2_sprite.png", f"{base_path}workstation_1_sprite.png"],
                 "storage_area": [f"{base_path}storage_area_1_sprite.png"],
                 "loading_dock": [f"{base_path}loading_dock_1_sprite.png"],
                 "wall_horizontal": [f"{base_path}wall_horizontal_1_sprite.png"],      # Horizontal wall sprite
@@ -620,6 +694,8 @@ class ContinuousPathfindingEnv(MultiAgentEnv):
         print("ENDING DEBUG OUTPUT FOR INIT METHOD:>")
         print(":"*100) 
 
+        super().__init__()
+
     
 #--------------------------------------HELPER METHODS----------------------------------------
 
@@ -641,6 +717,8 @@ class ContinuousPathfindingEnv(MultiAgentEnv):
         # Calculate and return the Euclidean distance
         return np.linalg.norm(current_agent_position - target_goal_position)
 
+    
+
     def _get_observation(self, agent_id):
         """
         Get the observation for a specific agent by calling the helper function.
@@ -651,114 +729,22 @@ class ContinuousPathfindingEnv(MultiAgentEnv):
         Returns:
             dict: Observation for the agent.
         """
-        observation = _compute_agent_observation(
-            agent_id=agent_id,
-            agent_positions=self.agent_positions,
-            agent_orientations=self.agent_orientations,
-            agent_speeds=self.agent_speeds,
-            agent_goals=self.agent_goals,
-            obstacles=self.obstacles,
-            workstations=self.workstations,
-            entrances=self.entrances,
-            storage_areas=self.storage_areas,
-            loading_docks=self.loading_docks,
-            walls=self.walls,
-            field_size=self.field_size,
-            sensor_fov=self.sensor_fov,
-            num_sensor_rays=self.num_sensor_rays,
-            sensor_range=self.sensor_range,
-            lidar_readings=self.lidar_readings.get(agent_id, np.zeros(self.num_sensor_rays, dtype=np.float32)),
-            collision_boundaries=self.collision_boundaries,
-            scale_x=self.scale_x,
-            scale_y=self.scale_y,
-            agents_relative_positions=compute_agents_relative_positions(
-                agent_id, self.agent_positions
-            ),
-            other_collision_categories_to_avoid_map=_generate_collision_category_map(
-                self.field_size, self.collision_boundaries, self.scale_x, self.scale_y
-            ).flatten(),  # Flatten to align with observation space
-            time_step=self.current_step,
-            max_timesteps=self.max_timesteps,
-            status=self.agent_statuses.get(agent_id, 0),  # Default to 0 if status is missing
-            action_mask=_get_action_mask(
-                agent_id, self.agent_positions, self.agent_goals
-            ),
-        )
-    
-        # Return the structured observation
-        return observation
-    
-    
-        
-    def _get_observation_old(self, agent_id):
-        """
-        Get the observation for a specific agent by calling the helper function.
-    
-        Args:
-            agent_id (str): The ID of the agent.
-    
-        Returns:
-            dict: Observation for the agent.
-        """
-        
-    
-        observations = _compute_agent_observation(
-            agent_id=agent_id,
-            agent_positions=self.agent_positions,
-            agent_orientations=self.agent_orientations,
-            agent_speeds=self.agent_speeds,
-            agent_goals=self.agent_goals,
-            obstacles=self.obstacles,
-            workstations=self.workstations,
-            entrances=self.entrances,
-            storage_areas=self.storage_areas,
-            loading_docks=self.loading_docks,
-            walls=self.walls,
-            field_size=self.field_size,
-            sensor_fov=self.sensor_fov,
-            num_sensor_rays=self.num_sensor_rays,
-            sensor_range=self.sensor_range,
-            lidar_readings=self.lidar_readings,
-            collision_boundaries=self.collision_boundaries,
-            scale_x=self.scale_x, 
-            scale_y=self.scale_y,
-            agents_relative_positions=compute_agents_relative_positions(agent_id, self.agent_positions),
-            other_collision_categories_to_avoid_map=_generate_collision_category_map(self.field_size, self.collision_boundaries, self.scale_x, self.scale_y),
-            time_step=self.current_step,
-            max_timesteps=self.max_timesteps,
-            status=self.agent_statuses.get(agent_id, 0),  # Default to 0 if status is missing
-            action_mask=_get_action_mask(agent_id, self.agent_positions, self.agent_goals)
-        )
-        
-        # Flatten the observation before returning
-        #observation = _flatten_observation(observation)
+        if agent_id not in self.agents:
+            raise ValueError(f"Agent {agent_id} not found in the environment.")
+            
+        #return {i: self.get_observation_space(i).sample() for i in self.agents}
+        return self.get_observation_space(agent_id).sample()
 
-        #flat_obs = {
-         #   agent_id: flatten_observation(obs)
-          #  for agent_id, obs in observations.items()
-        #}
-        
-        # Print the Flattened observation shape
-        #print(f"Flattened observation shape: {observation.shape}")
-        
-        return observations
-
+    
+  
 
     
     def get_local_sensor_data(self, agent_id):
         """
         Computes local sensor observations for the agent (e.g., LIDAR or proximity data).
         """
-        # Replace this with actual sensor observation logic
+        # Replace with actual sensor observation logic
         return self.sensors[agent_id]
-
-    
-    def action_space(self, agent_id):
-        action_space = self.action_spaces.get(agent_id, None)  # Access action space from the dictionary
-        if action_space is None:
-            print(f"Warning: No action space defined for agent '{agent_id}'")
-        return action_space
-
 
 
     def clamp_position(self, x, y):
@@ -896,8 +882,22 @@ class ContinuousPathfindingEnv(MultiAgentEnv):
         """
         # Call _is_position_valid to check for collisions
         return _is_position_valid_XMG(agent, agent_rect, self.collision_boundaries, self.agent_rects, self.goal_rects)
+        
 
-
+    def is_position_valid_XMAG(self, agent, agent_rect):
+        """
+        Validate if an agent's position is free of collisions.
+    
+        Args:
+            agent (str): The agent's ID.
+            agent_rect (pygame.Rect): The agent's rectangle for collision testing.
+    
+        Returns:
+            bool: True if the position is valid, False if there is a collision.
+        """
+        # Call _is_position_valid to check for collisions
+        return _is_position_valid_XMAG(agent, agent_rect, self.collision_boundaries, self.agent_rects, self.goal_rects)
+        
 
     def setup_collision_boundaries(self):
         """
@@ -1064,9 +1064,11 @@ class ContinuousPathfindingEnv(MultiAgentEnv):
             # Generate random start position
             if self.agent_positions[agent] is None:
                 while True:
-                    proposed_start = get_random_start_positions(
-                        self.env_name, self.num_agents, margin=self.margin, scale=self.scale
-                    )[agent]
+                    proposed_start = get_random_start_positions(env_name=self.env_name, 
+                                                              num_agents=self.num_agents,
+                                                              object_size=self.agent_size,
+                                                              margin=self.agent_margin, 
+                                                              scale=self.agent_scale)[agent]
                     start_rect = create_centered_rect(proposed_start, self.agent_size)
                     if self.is_position_valid_XM(agent, start_rect):
                         self.agent_positions[agent] = proposed_start
@@ -1076,9 +1078,12 @@ class ContinuousPathfindingEnv(MultiAgentEnv):
             # Generate random goal position
             if self.agent_goals[agent] is None:
                 while True:
-                    proposed_goal = get_random_goal_positions(
-                        self.env_name, self.num_agents, margin=self.margin, scale=self.scale
-                    )[agent]
+                    proposed_goal = get_random_goal_positions(env_name=self.env_name, 
+                                                            num_agents=self.num_agents, 
+                                                            goal_size=self.goal_size, 
+                                                            margin=self.goal_margin, 
+                                                            scale=self.goal_scale
+                                                            )[agent]
                     goal_rect = create_centered_rect(proposed_goal, self.goal_size)
                     if self.is_position_valid_XG(agent, goal_rect) and proposed_goal != self.agent_positions[agent]:
                         self.agent_goals[agent] = proposed_goal
@@ -1092,9 +1097,12 @@ class ContinuousPathfindingEnv(MultiAgentEnv):
                     #print(f"Regenerating goal for {agent} due to collision with {other_agent}")
                     while True:
                         # Generate a new goal for the agent
-                        new_goal = get_random_goal_positions(
-                            self.env_name, self.num_agents, margin=self.margin, scale=self.scale
-                        )[agent]
+                        new_goal = get_random_goal_positions(env_name=self.env_name, 
+                                                            num_agents=self.num_agents, 
+                                                            goal_size=self.goal_size, 
+                                                            margin=self.goal_margin, 
+                                                            scale=self.goal_scale
+                                                            )[agent]
                         new_goal_rect = create_centered_rect(new_goal, self.goal_size)
 
                         # Ensure the new goal is not the same as the current position or any other goal
@@ -1154,13 +1162,19 @@ class ContinuousPathfindingEnv(MultiAgentEnv):
         # Construct initial observations
         observations = {}
         infos = {}
-    
+        
+        observations = {agent: self.get_observation_space(agent).sample() for agent in self.agents}
+        
+        for agent in self.agents:
+            infos[agent] = {}  # Initialize empty info dict per agent
+
         # Ensure the observation space keys are sorted
         #sorted_observation_keys = sorted(self.observation_spaces[agent].spaces.keys())
         
+        """        
         for agent in self.agents:
 
-            """
+            
             # Get the observation for the agent
             obs = self._get_observation(agent)
 
@@ -1177,13 +1191,13 @@ class ContinuousPathfindingEnv(MultiAgentEnv):
                     f"Observation for agent {agent} does not match the defined observation space.\n"
                     f"Expected: {self.observation_space[agent]}\nActual: {sorted_obs}"
                 )
-            """
+            
             # Update observations and infos
             observations[agent] = self._get_observation(agent)
             #observations[agent] = sorted_obs
             infos[agent] = {}  # Initialize empty info dict per agent
 
-        """
+        
         # Debug print for alignment
         print("#" * 100)
         for agent, rect in self.agent_rects.items():
@@ -1209,7 +1223,7 @@ class ContinuousPathfindingEnv(MultiAgentEnv):
         elif self.render_mode == "rgb_array":
             self._render_rgb_array()
 
-                 
+
         print("ENDING DEBUG OUTPUT FOR RESET METHOD:>")
         print(":"*100)
 
@@ -1218,140 +1232,79 @@ class ContinuousPathfindingEnv(MultiAgentEnv):
 #----------------------------STEP METHOD--------------------------------------------------
 
 
-    def _apply_Lyapunov_action(self, agent, action):
+    
+    def _apply_smooth_action(self, agent, action):
+        
         """
         Applies the given action to update the agent's state (position, velocity, orientation),
-        ensuring smooth movement and handling collisions.
+        ensuring smooth movement.
         
         Args:
             agent (str): The ID of the agent.
             action (list or array): The action for the agent, assumed to be [delta_orientation, delta_speed].
         """
-
-        # Extract action (steering and speed)
-        steering, speed = action
-        
-        # Compute LIDAR readings distances for collision avoidance 
-        lidar_distances = self.lidar_readings[agent]["distances"]
-
-        # Avoid collisions using LIDAR reading output to Compute collision avoidance action
-        collision_avoided_action = avoid_collision_action(lidar_distances, self.SAFE_DISTANCE, self.max_speed, steering)
-        
-    #        adjusted_steering, adjusted_speed = collision_avoided_action
-        
-        # Parse the adjusted collision_avoided_action for updating agent states
-        delta_orientation, delta_speed = collision_avoided_action
-    #        delta_orientation, delta_speed = action
-
-        # Update orientation and wrap within [-π, π]
-        self.agent_states[agent]['orientation'] = (self.agent_states[agent]['orientation'] + delta_orientation) % (2 * np.pi)
-        if self.agent_states[agent]['orientation'] > np.pi:
-            self.agent_states[agent]['orientation'] -= 2 * np.pi
-
-        # Update velocity, ensuring it remains within the valid range
-        self.agent_states[agent]['velocity'] = max(0, min(self.max_speed, self.agent_states[agent]['velocity'] + delta_speed))
-
-        # Calculate the new position based on updated velocity and orientation
-        # Get observation and compute smooth action
-        observation = self._get_observation(agent)
-        action = self.policy.compute_action(observation)
+        # If agent is already terminated, do nothing
+        if self.terminated_agents.get(agent, False):
+            return
+            
+        delta_orientation, delta_speed = action
     
-        # Convert action to tuple
-        action_tuple = tuple(action.squeeze(0).tolist())
-
-        # Get the current velocity magnitude (scalar)
-        previous_velocity = self.agent_states[agent].get("velocity", 0.0)
-    
-        # Compute the action's direction (unit vector)
-        action_magnitude = np.linalg.norm(action_tuple)
-        if action_magnitude > 0:
-            action_direction = tuple(delta / action_magnitude for delta in action_tuple)
-        else:
-            action_direction = (0.0, 0.0)  # No movement if the action magnitude is zero
-    
-        # Smooth velocity magnitude
-        smoothed_velocity = (previous_velocity + action_magnitude) / 2
-    
-        # Clamp the velocity to the maximum speed
-        smoothed_velocity = min(smoothed_velocity, self.max_speed)
-    
-        # Update agent's velocity (scalar)
-        self.agent_states[agent]["velocity"] = smoothed_velocity
-    
-        # Update agent's position using the smoothed velocity and direction
-        self.agent_positions[agent] = tuple(
-            pos + smoothed_velocity * direction * 0.1
-            for pos, direction in zip(self.agent_positions[agent], action_direction)
-        )
-        """
-        print(f"Agent: {agent}")
-        print(f"Action Tuple: {action_tuple}")
-        print(f"Previous Velocity: {previous_velocity}")
-        print(f"Action Direction: {action_direction}")
-        print(f"Smoothed Velocity: {smoothed_velocity}")
-        print(f"New Position: {self.agent_positions[agent]}")
-            """
+        # Get agent's current state
         x, y = self.agent_positions[agent]
-        velocity = self.agent_states[agent]['velocity']
-        orientation = self.agent_states[agent]['orientation']
-
-        proposed_x = x + velocity * np.cos(orientation)
-        proposed_y = y + velocity * np.sin(orientation)
-        proposed_position = (proposed_x, proposed_y)
-        
-        # store that agent's new position for further processing
-        self.agent_positions[agent] = proposed_position
+        current_speed = self.agent_states[agent]['velocity']
+        current_orientation = self.agent_states[agent]['orientation']
+        goal_x, goal_y = self.agent_goals[agent]  # Get goal position
     
-
-    def _apply_LidarAC_action(self, agent, action):
-        """
-        Applies the given action to update the agent's state (position, velocity, orientation),
-        ensuring smooth movement and handling collisions.
+        # Check if agent is at goal (within tolerance)
+        if np.linalg.norm(np.array([x, y]) - np.array([goal_x, goal_y])) < self.goal_radius:         
+            # Store updated values to keep the agent in it's goal
+            self.agent_states[agent]['orientation'] = 0  # Stop turning  
+            self.agent_states[agent]['velocity'] = 0  # Stop moving  
+            self.agent_states[agent]["position"] = (goal_x, goal_y)  # Lock position 
+            self.terminated_agents[agent] = True  # Mark as terminated in dictionary
         
-        Args:
-            agent (str): The ID of the agent.
-            action (list or array): The action for the agent, assumed to be [delta_orientation, delta_speed].
-        """
-
-        # Extract action (steering and speed)
-        steering, speed = action
+            self.agent_orientations[agent] = 0  # Stop turning 
+            self.agent_speeds[agent] = 0  # Stop moving
+            self.agent_positions[agent] = (goal_x, goal_y)  # Lock position   
         
-        # Compute LIDAR readings distances for collision avoidance 
-        lidar_distances = self.lidar_readings[agent]["distances"]
-
-        # Avoid collisions using LIDAR reading output to Compute collision avoidance action
-        collision_avoided_action = avoid_collision_action(lidar_distances, self.SAFE_DISTANCE, self.max_speed, steering)
+            return  # Do not update position further
+            
+    
+        # Define maximum orientation change per step (prevents sudden turns)
+        max_rotation_speed = np.radians(45)  # Limit to 20 degrees per update (to be adjusted. optimal: 5-15)
+        #max_rotation_speed = np.radians(10)  # Limit to 10 degrees per update (to be adjusted. optimal: 5-15)
+        #max_rotation_speed = np.radians(7)  # Reduced from 10° for softer turns
+        delta_orientation = np.clip(delta_orientation, -max_rotation_speed, max_rotation_speed)
         
-    #        adjusted_steering, adjusted_speed = collision_avoided_action
+        # Smoothly update orientation
+        new_orientation = (current_orientation + delta_orientation) % (2 * np.pi)
+    
+        # Limit acceleration for gradual speed changes
+        #max_acceleration = self.max_speed / 10  # to be adjusted for smoother acceleration
+        max_acceleration = self.max_speed / 2  # Reduced acceleration for smoother transitions
+        new_speed = np.clip(current_speed + np.clip(delta_speed, -max_acceleration, max_acceleration), 0, self.max_speed)
+    
+        # **Trapezoidal Velocity Integration (Smoother Position Updates)**
+        #avg_speed = (current_speed + new_speed) / 2  # Prevents sudden jumps
+        avg_speed = (3 * current_speed + new_speed) / 4  # Weighted average for smoother changes
+        #avg_speed = (current_speed + 2 * new_speed) / 3  # More emphasis on new speed
+        dx = avg_speed * np.cos(new_orientation) * self.dt # to be adjusted
+        dy = avg_speed * np.sin(new_orientation) * self.dt
+    
+        # Compute new position
+        new_x = x + dx
+        new_y = y + dy
+        new_position = (new_x, new_y)
+    
+        # Store updated values
+        self.agent_states[agent]['orientation'] = new_orientation  
+        self.agent_states[agent]['velocity'] = new_speed  
+        self.agent_states[agent]["position"] = new_position  
+    
+        self.agent_orientations[agent] = new_orientation
+        self.agent_speeds[agent] = new_speed
+        self.agent_positions[agent] = new_position  
         
-        # Parse the adjusted collision_avoided_action for updating agent states
-        delta_orientation, delta_speed = collision_avoided_action
-    #        delta_orientation, delta_speed = action
-
-        # Update orientation and wrap within [-π, π]
-        self.agent_states[agent]['orientation'] = (self.agent_states[agent]['orientation'] + delta_orientation) % (2 * np.pi)
-        if self.agent_states[agent]['orientation'] > np.pi:
-            self.agent_states[agent]['orientation'] -= 2 * np.pi
-
-        # Update velocity, ensuring it remains within the valid range
-        self.agent_states[agent]['velocity'] = max(0, min(self.max_speed, self.agent_states[agent]['velocity'] + delta_speed))
-        
-        self.agent_orientations[agent] = self.agent_states[agent]['orientation']
-        self.agent_speeds[agent] = self.agent_states[agent]['velocity'] 
-        
-        # Calculate the new position based on updated velocity and orientation
-
-        # COMPUTE LYPUNOV ACTION AND USE IT TO UPDATE AGENT-POSITION DICTIONARY (self.agent_positions[agent])        
-        x, y = self.agent_positions[agent]
-        velocity = self.agent_states[agent]['velocity']
-        orientation = self.agent_states[agent]['orientation']
-
-        proposed_x = x + velocity * np.cos(orientation)*self.dt
-        proposed_y = y + velocity * np.sin(orientation)*self.dt
-        proposed_position = (proposed_x, proposed_y)
-        
-        # store that agent's new position for further processing
-        self.agent_positions[agent] = proposed_position
              
     def _apply_PPOTorch_action(self, agent, action):
         """
@@ -1403,6 +1356,7 @@ class ContinuousPathfindingEnv(MultiAgentEnv):
         proposed_position = (proposed_x, proposed_y)
         
         # store that agent's new position for further processing
+        self.agent_states[agent]['position'] = proposed_position
         self.agent_positions[agent] = proposed_position
              
 
@@ -1515,29 +1469,48 @@ class ContinuousPathfindingEnv(MultiAgentEnv):
             """
         # Directly use actions for each agent
         for agent, action_data in actions.items():
-            if agent in self.terminated_agents:
+            if self.terminated_agents.get(agent, False):   
+            #if agent in self.terminated_agents:
                 # Skip updates for terminated agents
                 terminateds[agent] = True
                 truncateds[agent] = False
-                observations[agent] = self._get_observation(agent)  # Keep last valid observation
-                rewards[agent] = 0  # No further rewards
+                #observations[agent] = self._get_observation(agent)  
+                observations[agent] = self.get_observation_space(agent).sample() # Keep last valid observation
+                #rewards[agent] = 0  # No further rewards
                 infos[agent] = {"status": "goal_reached"}
                 continue
-   
-            # Unpack action data
-            action, _, _ = action_data
+
+
+            """
+            # ALTERNATIVELY REMOVE AGENT FROM SIMULATION
+            if agent in self.terminated_agents:
+                del self.agent_positions[agent]
+                del self.agent_states[agent]
+                continue
+                """
+    
+            # Case 1: Check if action_data is a tuple (action_array, [], info)
+            if isinstance(action_data, tuple) and len(action_data) >= 1:
+                action = action_data[0]  # Extract the first item (action array)
+    
+            # Case 2: Check if action_data is a dictionary (for multi-agent case)
+            elif isinstance(action_data, dict):
+                action = action_data  # For handling case where it's a dict
+    
+            else:
+                # Case 3: Directly use the action (if it's not in a tuple or dictionary)
+                action = action_data
             
-            #action = action_data
-            
-            action = np.array(action).flatten()  # Ensure action is a flat array
-            
+            # Ensure action is a flat array (in case it's an array or other nested structure)
+            action = np.array(action).flatten()
+
             # Debug: Print the received actions
             #print("Flattened Raw agent's action received:", action)
             
             # Update the agent's state with the raw flattened action
-            self._apply_PPOTorch_action(agent, action)
-            
-            self._apply_PFavoid_action(agent, action) # To be called when needed
+            #self._apply_PPOTorch_action(agent, action)
+            self._apply_smooth_action(agent, action)
+            #self._apply_PFavoid_action(agent, action) # To be called when needed
             
             # Apply the computed action in the environment
             #self._apply_LidarAC_action(agent, action)
@@ -1556,7 +1529,8 @@ class ContinuousPathfindingEnv(MultiAgentEnv):
             proposed_agent_rect = _create_centered_rect(proposed_position, self.agent_size)
     
             # Validate position with collision checks
-            if self.is_position_valid_XMG(agent, proposed_agent_rect):
+            #if self.is_position_valid_XMG(agent, proposed_agent_rect):  # Ignore that agent's goal only
+            if self.is_position_valid_XMAG(agent, proposed_agent_rect):  # Ignore all agent goals in the simulation
                 # Update position if valid
                 self.agent_positions[agent] = proposed_position
                 self.agent_rects[agent] = proposed_agent_rect
@@ -1646,18 +1620,24 @@ class ContinuousPathfindingEnv(MultiAgentEnv):
                 infos[agent] = {"status": "collision", "invalid_action": action}
     
             # Update distance to goal for reward calculation
-            distance_to_goal = self.distance_to_goal(agent)
-    
+            updated_x, updated_y = self.agent_positions[agent] # Get updated agent position
+            goal_x, goal_y = self.agent_goals[agent]  # Get goal position
+            #distance_to_goal = self.distance_to_goal(agent)
+            distance_to_goal = np.linalg.norm(np.array([updated_x, updated_y]) - np.array([goal_x, goal_y])) 
+
+
             # Calculate the reward for the agent
             rewards[agent] = self.calculate_agent_reward(agent, distance_to_goal)
     
             # Update observations
-            observations[agent] = self._get_observation(agent)
+            #observations[agent] = self._get_observation(agent)
+            observations[agent] = self.get_observation_space(agent).sample() 
+
     
             # Check if the agent has reached its goal
             #print(f"Agent {agent}: Distance to goal = {distance_to_goal}, Goal radius = {self.goal_radius}")
-            if distance_to_goal <= self.goal_radius + 1e-5:  # Add small tolerance
-                self.terminated_agents.add(agent)  # Mark agent as terminated
+            if distance_to_goal <= self.goal_radius:  
+                #self.terminated_agents[agent] = True  # Mark agent as terminated
                 #print(f"Agent {agent} marked as terminated.")
                 terminateds[agent] = True
                 truncateds[agent] = False
@@ -1815,51 +1795,7 @@ class ContinuousPathfindingEnv(MultiAgentEnv):
                 pygame.draw.rect(self.screen, (255, 165, 0), rect, 2)  # Draw orange rectangles
 
 
-        """""
-        # Render sensor rays and collisions
-        for agent, agent_rays in self.sensor_rays.items():  # Since `self.sensor_rays` stores agents' rays
-            for ray_start, ray_end in agent_rays:
-                # Scale ray coordinates
-                start = (ray_start[0] * self.scale_x, ray_start[1] * self.scale_y)
-                end = (ray_end[0] * self.scale_x, ray_end[1] * self.scale_y)
-        
-                # Check for intersections with collision boundaries
-                collision_detected = False
-                collision_point = None
-        
-                for category, boundaries in self.collision_boundaries.items():
-                    if isinstance(boundaries, dict):  # Handle dictionary-based categories
-                        for agent_id, rect in boundaries.items():
-                            # Skip the current agent's own goal or agent's rectangle
-                            if agent_id == agent:
-                                continue
-                            # Detect collision with other agents' goal/agent boundary areas
-                            if rect.clipline(start, end):
-                                collision_detected = True
-                                collision_point = rect.clipline(start, end)[0]
-                                break
-                    elif isinstance(boundaries, list):  # Handle list-based categories boundary areas
-                        for rect in boundaries:
-                            if rect.clipline(start, end):
-                                collision_detected = True
-                                collision_point = rect.clipline(start, end)[0]
-                                break
-        
-                    # If collision has already been detected in one of the categories, break out of the loop
-                    if collision_detected:
-                        break
-        
-                # Draw rays
-                ray_color = (0, 255, 0) if not collision_detected else (255, 0, 0)  # Green for clear, Red for collision
-                pygame.draw.line(self.screen, ray_color, start, end, 2)
-        
-                # Draw collision point if detected
-                if collision_detected and collision_point:
-                    pygame.draw.circle(self.screen, (255, 255, 0), collision_point, 5)  # Yellow dot for collision
 
-        """""
-
-        
         # Render sensor rays and collisions
         for agent_id, lidar_data in self.lidar_readings.items():
             distances = lidar_data["distances"]
@@ -1921,7 +1857,11 @@ class ContinuousPathfindingEnv(MultiAgentEnv):
             agent_rects=self.agent_rects,
             goal_rects=self.goal_rects,
             unique_agent_goal_colors=self.unique_agent_goal_colors,
-            terminated_agents=self.terminated_agents
+            terminated_agents=self.terminated_agents,
+            goal_positions=self.goal_positions, 
+            goal_size=self.goal_size, 
+            scale_x=self.scale_x, 
+            scale_y=self.scale_y
         )
 
         
