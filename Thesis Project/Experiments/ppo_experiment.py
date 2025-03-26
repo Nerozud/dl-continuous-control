@@ -65,9 +65,9 @@ if __name__ == "__main__":
     from ray.rllib.utils.metrics import *
     
     ray.init(
-        _temp_dir="/nfs1/obiorah/workspace/Ray_Results/tmp",  # Temporary directory for Ray's process
+        _temp_dir="/workspace/Ray_Results/tmp",  # Temporary directory for Ray's process
        # object_store_memory=2 * 1024 * 1024 * 1024,  # 2GB object store memory limit
-        #_plasma_directory="/nfs1/obiorah/workspace/Ray_Results/plasma",  # Plasma store directory
+        #_plasma_directory="/workspace/Ray_Results/plasma",  # Plasma store directory
         #_redis_max_memory=4 * 1024 * 1024 * 1024,  # Set 4GB memory limit for Redis
         #logging_level="INFO",  # Set logging level
         #log_to_driver=True,  # Log output to driver
@@ -78,7 +78,7 @@ if __name__ == "__main__":
     # Define the custom logger creator function
     def logger_creator(config):
         # Define your custom log directory
-        logdir = "/nfs1/obiorah/workspace/Ray_Results/logs"
+        logdir = "/workspace/Ray_Results/logs"
         
         # Ensure the directory exists
         if not os.path.exists(logdir):
